@@ -1,0 +1,21 @@
+# C:/Users/User/py/rename/data.yaml （原訓練用的那份）
+path: C:/Users/User/py/rename   # 資料集的根目錄
+
+train:
+  images: images
+  labels: labels
+
+val:
+  images: images2
+  labels: labels2
+
+# 新增 test 區塊
+test:
+  images: C:/Users/User/py/rename/images3      # 把你的測試集放在 rename/images_test 裡
+  labels: C:/Users/User/py/rename/labels3      # 把對應的 .txt 放在 rename/labels_test 裡
+
+nc:        1                # 類別數
+names:
+  0: person
+format:   yolo              # YOLO TXT 格式
+kpt_shape: [33, 3]          # 33 個 keypoints，每個 (x, y, v)
