@@ -1,0 +1,20 @@
+# 忽略圖片資料夾與所有常見圖片格式檔案
+
+# 忽略轉出圖檔與中間產物的資料夾
+frames/
+output_overlay/
+yolo_labels/
+output_json/
+csv_output_overlay/
+csv_output/
+runs/
+
+# 忽略常見圖片格式
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tiff
+*.webp
+*.svg

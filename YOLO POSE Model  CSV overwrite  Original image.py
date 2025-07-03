@@ -19,7 +19,7 @@ from pathlib import Path
 # ─── 使用者設定 ────────────────────────────────────
 CSV_PATH    = Path("C:/Users/User/Desktop/keypoints_pixelsn.csv")   # 偵測結果 CSV
 IMG_PATH    = Path("C:/Users/User/Desktop/picture/IMG_8190/frame_00035.jpg")  # 原始圖片
-OUTPUT_PATH = Path.cwd() / "output_overlay" / "IMG_8190" / "frame_00035_overlay.png"  # ← 改為 py 同層輸出
+OUTPUT_PATH = Path.cwd() / "csv_output_overlay" / "IMG_8190" / "frame_00035_overlay.png"  # ← 改為 py 同層輸出
 POINT_RADIUS = 5               # 圓點半徑 (像素)
 POINT_COLOR  = (0, 0, 255)     # BGR 紅色
 # ──────────────────────────────────────────────────
