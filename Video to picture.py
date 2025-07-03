@@ -37,8 +37,8 @@ def video_to_frames(video_path, output_folder, frame_interval=1):
 
 if __name__ == "__main__":
 
-    video_path = "C:\\Users\\User\\Desktop\\綜合揮拍姿勢影片\\IMG_9684.MOV" # 替換成你的影片路徑
-    output_folder = os.path.join(os.getcwd(), "frames", "IMG_9684")  # 指定巢狀資料夾
+    video_path = "C:\\Users\\User\\Desktop\\綜合揮拍姿勢影片\\IMG_9685.MOV" # 替換成你的影片路徑
+    output_folder = os.path.join(os.getcwd(), "frames", "IMG_9685")  # 指定巢狀資料夾
 
     frame_interval = 1
     video_to_frames(video_path, output_folder, frame_interval)
