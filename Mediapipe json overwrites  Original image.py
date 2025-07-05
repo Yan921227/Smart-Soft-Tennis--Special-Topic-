@@ -54,10 +54,10 @@ def process_folder(image_folder, json_folder, output_folder):
 
 if __name__ == "__main__":
     # 設定原始圖片所在的資料夾路徑
-    image_folder = "D:\\Special topic data collection(2)\\frames\\IMG_9676"
+    image_folder = "D:\\Special topic data collection(2)\\frames\\IMG_9677"
     # 設定 JSON 標註檔所在的資料夾路徑
-    json_folder = "output_json\IMG_9676"
+    json_folder = "output_json\IMG_9677"
     # 設定輸出疊加後圖片的資料夾路徑（改為與 py 檔案同層）
-    output_folder = os.path.join(os.getcwd(), "output_overlay", "IMG_9676")
+    output_folder = os.path.join(os.getcwd(), "output_overlay", "IMG_9677")
     
     process_folder(image_folder, json_folder, output_folder)
