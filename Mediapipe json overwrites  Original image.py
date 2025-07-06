@@ -59,5 +59,8 @@ if __name__ == "__main__":
     json_folder = "output_json\IMG_9685"
     # 設定輸出疊加後圖片的資料夾路徑（改為與 py 檔案同層）
     output_folder = os.path.join(os.getcwd(), "output_overlay", "IMG_9685")
+
+
+    # 確保輸出資料夾存在
     
     process_folder(image_folder, json_folder, output_folder)
