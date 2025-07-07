@@ -8,6 +8,7 @@ output_json/
 csv_output_overlay/
 csv_output/
 runs/
+YOLO_txt_output_overlay/
 
 # 忽略常見圖片格式
 *.png
