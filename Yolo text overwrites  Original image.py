@@ -94,10 +94,10 @@ def process_folder(image_folder, annotation_folder, output_folder):
 
 if __name__ == "__main__":
     # 圖片資料夾與標註資料夾（你原本指定的絕對路徑）
-    image_folder = "C:\\Users\\User\\Desktop\\picture\\IMG_8203"
-    annotation_folder = "C:\\Users\\User\\Desktop\\YOLO TXT\\IMG_8203"
+    image_folder = "D:\\Special topic data collection(2)\\frames\\IMG_9670"
+    annotation_folder = "yolo_txt\IMG_9670"
 
     # 👉 修改後：將疊加圖片輸出到 py 檔所在位置下的 output_overlay/IMG_8203
-    output_folder = Path.cwd() / "YOLO_txt_output_overlay" / "IMG_8203"
+    output_folder = Path.cwd() / "YOLO_txt_output_overlay" / "IMG_9670"
 
     process_folder(image_folder, annotation_folder, str(output_folder))
