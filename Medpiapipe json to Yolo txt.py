@@ -68,9 +68,9 @@ def process_json_folder(input_folder, output_folder):
 if __name__ == '__main__':
     # 請依照你的路徑修改：
     # 輸入：獨立 JSON 標註檔所在資料夾（例如，每張圖片一個 JSON 檔）
-    input_json_folder = "output_json\IMG_9671"
+    input_json_folder = "output_json\IMG_9672"
     # 輸出：轉換後的 YOLO 格式標註檔存放的資料夾（使用 py 檔目錄下的相對路徑）
-    output_yolo_folder = os.path.join(os.getcwd(), "yolo_txt", "IMG_9671")
+    output_yolo_folder = os.path.join(os.getcwd(), "yolo_txt", "IMG_9672")
     
     process_json_folder(input_json_folder, output_yolo_folder)
     print("所有 JSON 檔案轉換完成！")
