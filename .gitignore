@@ -3,7 +3,7 @@
 # 忽略轉出圖檔與中間產物的資料夾
 frames/
 output_overlay/
-yolo_labels/
+yolo_txt/
 output_json/
 csv_output_overlay/
 csv_output/
