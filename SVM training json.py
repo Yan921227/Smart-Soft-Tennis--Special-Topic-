@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-SVM 中文標籤版本（資料夾分組 + 超參數搜尋）
+SVM 中文標籤版本（資料夾分組 + 超參數搜尋 + 容錯 extract_pose）
 """
 
 import json, math, joblib
@@ -21,16 +21,24 @@ ROOT = Path("output_json")
 
 # ───── ② 資料夾 → 中文標籤 ─────
 FOLDER2LABEL = {
-    'IMG_9670': '正拍', 'IMG_9671': '正拍','IMG_9672': '正拍','IMG_9673': '正拍','IMG_9674': '正拍','IMG_9675': '正拍','IMG_9676': '正拍',
-    'IMG_9677': '反拍', 'IMG_9678': '反拍', 'IMG_9679': '反拍','IMG_9680': '反拍','IMG_9681': '反拍',
-    'IMG_9682': '基礎高壓發球','IMG_9683': '基礎高壓發球','IMG_9684': '基礎高壓發球','IMG_9685': '基礎高壓發球','IMG_9686': '基礎高壓發球',
-    'IMG_9687': '切球', 'IMG_9688': '切球', 'IMG_9689': '切球', 'IMG_9690': '切球', 'IMG_9691': '切球', 
-    'IMG_9692': '進階高壓發球','IMG_9693': '進階高壓發球','IMG_9694': '進階高壓發球','IMG_9695': '進階高壓發球','IMG_9696': '進階高壓發球',
-    
+    'IMG_9670':'正拍','IMG_9671':'正拍','IMG_9672':'正拍','IMG_9673':'正拍',
+    'IMG_9674':'正拍','IMG_9675':'正拍','IMG_9676':'正拍',
+
+    'IMG_9677':'反拍','IMG_9678':'反拍','IMG_9679':'反拍',
+    'IMG_9680':'反拍','IMG_9681':'反拍',
+
+    'IMG_9682':'基礎高壓發球','IMG_9683':'基礎高壓發球','IMG_9684':'基礎高壓發球',
+    'IMG_9685':'基礎高壓發球','IMG_9686':'基礎高壓發球',
+
+    'IMG_9687':'切球','IMG_9688':'切球','IMG_9689':'切球',
+    'IMG_9690':'切球','IMG_9691':'切球',
+
+    'IMG_9692':'進階高壓發球','IMG_9693':'進階高壓發球','IMG_9694':'進階高壓發球',
+    'IMG_9695':'進階高壓發球','IMG_9696':'進階高壓發球',
 }
 
-USE_Z      = False   # 要不要把 z 座標加進特徵
-SKIP_EVERY = 1      # 每 3 張取 1 張；=1 則每張都用
+USE_Z      = False   # 是否使用 z
+SKIP_EVERY = 1       # =1 表示每張都用
 
 # ───── 角度特徵設定 ─────
 ANGLE_TRIPLETS = [
@@ -38,6 +46,25 @@ ANGLE_TRIPLETS = [
     (23, 25, 27), (24, 26, 28)    # 膝關節
 ]
 
+# ───── 取 33 點工具 ─────
+def extract_pose(data, fname=''):
+    """
+    回傳 33 點 list，若結構對不上就回 None
+    可依需要再擴充 elif
+    """
+    if isinstance(data, dict) and 'pose' in data:
+        return data['pose']                                   # 你的主要格式
+    if isinstance(data, dict) and 'results' in data:          # Mediapipe JS
+        try:
+            return data['results'][0]['pose_landmarks']
+        except (KeyError, IndexError):
+            pass
+    if isinstance(data, list) and len(data) and 'keypoints' in data[0]:
+        return data[0]['keypoints']                           # list 包 dict
+    print(f'⚠️  {fname} 缺 pose，已跳過')
+    return None
+
+# ───── 角度計算 ─────
 def _angle(kps, a, b, c):
     ax, ay = kps[a]['x'], kps[a]['y']
     bx, by = kps[b]['x'], kps[b]['y']
@@ -49,28 +76,30 @@ def _angle(kps, a, b, c):
 
 def build_feat(kps):
     feat = []
-    for p in kps:                           # 33 點
+    for p in kps:
         feat += [p['x'], p['y']]
         if USE_Z:
             feat.append(p['z'])
     feat += [_angle(kps, *tri) for tri in ANGLE_TRIPLETS]
     return feat
 
-# ───── 讀取所有 JSON ─────
+# ───── 讀取 JSON ─────
 rows, labels, groups = [], [], []
 for folder in sorted(ROOT.iterdir()):
     if not folder.is_dir():
         continue
     label = FOLDER2LABEL.get(folder.name)
     if label is None:
-        print('⚠️  跳過未定義資料夾 →', folder.name)
-        continue
+        print('⚠️  未定義 →', folder.name); continue
 
     for i, jf in enumerate(sorted(folder.glob('*.json'))):
-        if i % SKIP_EVERY:          # 下採樣
+        if i % SKIP_EVERY:
             continue
         data = json.load(open(jf, 'r', encoding='utf-8'))
-        rows.append(build_feat(data['pose']))
+        pose_kps = extract_pose(data, jf.name)
+        if pose_kps is None:
+            continue
+        rows.append(build_feat(pose_kps))
         labels.append(label)
         groups.append(folder.name)
 
@@ -78,8 +107,7 @@ print('樣本總數:', len(rows), Counter(labels))
 
 # ───── 準備資料集 ─────
 X = np.asarray(rows)
-le = LabelEncoder()
-y = le.fit_transform(labels)
+le = LabelEncoder(); y = le.fit_transform(labels)
 groups = np.asarray(groups)
 
 gss = GroupShuffleSplit(test_size=0.2, random_state=42)
@@ -94,18 +122,13 @@ pipe = Pipeline([
 
 param_grid = {
     'svc__C':      [0.01, 0.1, 1, 10, 100],
-    'svc__gamma':  np.logspace(-4, -1, 7),   # 1e-4 … 1e-1
+    'svc__gamma':  np.logspace(-4, -1, 7),
     'svc__kernel': ['rbf', 'linear']
 }
 
-grid = GridSearchCV(
-    pipe,
-    param_grid,
-    cv=3,
-    scoring='f1_macro',
-    n_jobs=-1,
-    verbose=1
-)
+grid = GridSearchCV(pipe, param_grid,
+                    cv=3, scoring='f1_macro',
+                    n_jobs=-1, verbose=1)
 grid.fit(X_tr, y_tr)
 
 print('★ 最佳參數:', grid.best_params_)
