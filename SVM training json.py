@@ -34,7 +34,7 @@ FOLDER2LABEL = {  # <略，同上一份；如有新增資料夾記得補>
 }
 
 USE_Z      = False   # 是否使用 z
-SKIP_EVERY = 1       # 每張都用；大資料可調 3、5 下採樣
+SKIP_EVERY = 3       # 每張都用；大資料可調 3、5 下採樣
 
 # ───── 角度特徵 ─────
 ANGLE_TRIPLETS = [
@@ -110,11 +110,11 @@ pipe = Pipeline([
 ])
 
 param_grid = {
-    'linear_svc__C': [0.01, 0.1, 1, 10, 100]
+    'linear_svc__C': [0.1, 1, 10]
 }
 
 grid = GridSearchCV(pipe, param_grid,
-                    cv=3, n_jobs=-1,
+                    cv=2, n_jobs=-1,
                     scoring='f1_macro', verbose=1)
 grid.fit(X_tr, y_tr)
 
