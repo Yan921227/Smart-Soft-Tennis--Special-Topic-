@@ -1,10 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Random-Forest（GroupShuffleSplit × test_size=0.30）
+Random‑Forest（GroupShuffleSplit × test_size=0.30）
 ‧ 33 點座標   ‧ 8 個關節角   ‧ 3 個跳躍特徵
 ‧ 自動重抽確保測試集涵蓋全部類別
 ‧ GridSearchCV（多核心）
+
+⚠️ 本版調整：
+    1.   改用「手選參數網格」─ param_grid 與您截圖相同。
+    2.   引入 GroupKFold 取代預設 K‑Fold，並傳入 groups 參數，確保同一影片不跨折。
+    3.   RandomForestClassifier 啟用 oob_score=True，讓袋外樣本可作為附加指標。
+
+執行時間 ≈ (#參數組合 × n_splits)；若過久可先縮減網格。
 """
 
 import json, math, joblib, sys
@@ -14,15 +21,15 @@ from collections import Counter
 import numpy as np
 from sklearn.preprocessing  import LabelEncoder
 from sklearn.ensemble       import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV, GroupShuffleSplit
+from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, GroupKFold
 from sklearn.metrics        import classification_report, confusion_matrix
 
 # ───── 0. 全域參數 ─────
-ROOT        = Path("output_json")   # 你的資料根目錄
-USE_Z       = False                 # 是否把 z 也放進特徵
-SKIP_EVERY  = 1                     # 每張都用；可調 2、3 下採樣
-TEST_RATE   = 0.30                  # ← test_size
-MAX_RETRY   = 25                    # 最多重抽 25 次
+ROOT        = Path("output_json")      # 你的資料根目錄
+USE_Z       = False                     # 是否把 z 也放進特徵
+SKIP_EVERY  = 1                         # 每張都用；可調 2、3 下採樣
+TEST_RATE   = 0.30                      # ← test_size
+MAX_RETRY   = 25                        # 最多重抽 25 次
 
 # ───── 1. 資料夾 → 中文動作 ─────
 FOLDER2LABEL = {
@@ -44,8 +51,8 @@ FOLDER2LABEL = {
 ANGLE_TRIPLETS = [
     (11, 13, 15), (12, 14, 16),     # 手肘
     (23, 25, 27), (24, 26, 28),     # 膝關節
-    (15, 13, 11), (16, 14, 12),     # 腕-肘-肩
-    (12, 24, 26), (11, 23, 25)      # 肩-髖-膝
+    (15, 13, 11), (16, 14, 12),     # 腕‑肘‑肩
+    (12, 24, 26), (11, 23, 25)      # 肩‑髖‑膝
 ]
 
 # ───── 取 33 點 ─────
@@ -120,16 +127,35 @@ print("train 分布:", Counter(y_tr))
 print("test  分布:", Counter(y_te))
 
 # ───── 5. RandomForest + GridSearch ─────
-rf = RandomForestClassifier(class_weight='balanced',
-                            n_jobs=-1, random_state=42)
+rf = RandomForestClassifier(
+        class_weight='balanced',
+        n_jobs=-1,
+        random_state=42,
+        oob_score=True
+)
+
+# ❶ 手選參數網格
 param_grid = {
-    'n_estimators':     [200, 400, 600],
-    'min_samples_leaf': [1, 3]
+    'n_estimators':      [50, 100, 200, 300],
+    'max_depth':        [None, 5, 10, 20],
+    'min_samples_split':[2, 5, 10],
+    'min_samples_leaf': [1, 2],
+    'max_features':     ['sqrt', 'log2'],
 }
-grid = GridSearchCV(rf, param_grid,
-                    cv=3, n_jobs=-1,
-                    scoring='f1_macro', verbose=2)
-grid.fit(X_tr, y_tr)
+
+# ❷ 分組交叉驗證確保影片不跨折
+cv = GroupKFold(n_splits=3)
+
+grid = GridSearchCV(
+        estimator  = rf,
+        param_grid = param_grid,
+        cv         = cv,
+        n_jobs     = -1,
+        scoring    = 'f1_macro',
+        verbose    = 2
+)
+
+grid.fit(X_tr, y_tr, groups=groups[tr_idx])
 
 print("\n★ 最佳參數:", grid.best_params_)
 clf = grid.best_estimator_
