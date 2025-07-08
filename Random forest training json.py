@@ -26,7 +26,7 @@ from sklearn.metrics        import classification_report, confusion_matrix
 
 # ───── 0. 全域參數 ─────
 ROOT        = Path("output_json")      # 你的資料根目錄
-USE_Z       = False                     # 是否把 z 也放進特徵
+USE_Z       = True                     # 是否把 z 也放進特徵
 SKIP_EVERY  = 1                         # 每張都用；可調 2、3 下採樣
 TEST_RATE   = 0.30                      # ← test_size
 MAX_RETRY   = 25                        # 最多重抽 25 次
@@ -136,10 +136,10 @@ rf = RandomForestClassifier(
 
 # ❶ 手選參數網格
 param_grid = {
-    'n_estimators':      [50, 100, 200, 300],
-    'max_depth':        [None, 5, 10, 20],
+    'n_estimators':      [80, 100, 120, 150],
+    'max_depth':        [None, 6, 8, 10],
     'min_samples_split':[2, 5, 10],
-    'min_samples_leaf': [1, 2],
+    'min_samples_leaf': [1, 2, 4, 6],
     'max_features':     ['sqrt', 'log2'],
 }
 
