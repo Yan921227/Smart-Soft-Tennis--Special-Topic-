@@ -123,7 +123,7 @@ le = LabelEncoder()
 y = le.fit_transform(labels)
 groups = np.asarray(groups)
 
-split = GroupShuffleSplit(test_size=0.2, random_state=42)
+split = GroupShuffleSplit(test_size=0.3, random_state=42)
 tr_idx, te_idx = next(split.split(X, y, groups))
 X_tr, X_te = X[tr_idx], X[te_idx]
 y_tr, y_te = y[tr_idx], y[te_idx]
