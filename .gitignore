@@ -19,3 +19,4 @@ YOLO_txt_output_overlay/
 *.tiff
 *.webp
 *.svg
+*.pkl
