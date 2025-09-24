@@ -20,3 +20,5 @@ YOLO_txt_output_overlay/
 *.webp
 *.svg
 *.pkl
+*.csv
+*.mp4
