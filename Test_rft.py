@@ -1,23 +1,13 @@
-
-
 # -*- coding: utf-8 -*-
 """
-Super‑simple test script: set VIDEO and MODEL below and run.
-No argparse, no flags. (Optionally accept two positional args: video model)
-
-Usage A (no args):
-    # edit the two lines below, then
-    python test_video_predict_softtennis_MINI.py
-
-Usage B (positional):
-    python test_video_predict_softtennis_MINI.py demo.mp4 softtennis_pose_balanced_rf_v2.pkl
-
-Outputs:
-- Console majority label for the whole clip
-- Optional per‑frame CSV and annotated video (toggle by flags below)
+Super-simple test script:
+- 設定 VIDEO / MODEL 後直接執行（或用兩個位置參數：video model）
+- MediaPipe 擷取姿態 → 特徵 → RandomForest 推論
+- 中文疊字改用 Pillow（避免 cv2.putText 變 ????）
+- 加入啟動診斷與錯誤輸出，避免程式悄悄結束
 """
 from __future__ import annotations
-import sys, math
+import sys, math, os, traceback
 from collections import deque, Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,33 +17,67 @@ import cv2
 import numpy as np
 import joblib
 
-# ======= EDIT THESE TWO LINES (if not using positional args) =======
-VIDEO = Path("D:\\Special topic data collection(1)\\videos\\IMG_8196.MOV")
+# Pillow for 中文文字
+from PIL import Image, ImageDraw, ImageFont
+
+# 供輸出 .xlsx
+try:
+    import pandas as pd
+except Exception:
+    sys.exit("請先安裝：pip install pandas openpyxl")
+
+# ======= 這兩行請改成你的路徑（若不用位置參數） =======
+VIDEO = Path(r"D:\Special topic data collection(1)\videos\IMG_8196.MOV")
 MODEL = Path("save_all_pose_rft_20250917.pkl")
-# ================================================================
+# =====================================================
 
 # Quick toggles
-SAVE_CSV   = True
-CSV_PATH   = Path("IMG_8196_demo.csv")
-SAVE_VIDEO = True
-VIDEO_OUT  = Path("IMG_8196_demo.mp4")
+SAVE_CSV    = False                          # ← 預設關閉 CSV
+CSV_PATH    = Path("IMG_8196_demo.csv")
+SAVE_XLSX   = True                           # ← 輸出 Excel
+XLSX_PATH   = Path("IMG_8196_demo.xlsx")
+SAVE_VIDEO  = True
+VIDEO_OUT   = Path("IMG_8196_demo.mp4")
+
 STRIDE     = 2
 SMOOTH     = 5
 MIN_DET    = 0.5
-WRIST_IDX_OVERRIDE = None   # set 15 for left‑hand, 16 for right‑hand, or None to keep model's config
+WRIST_IDX_OVERRIDE = None
+
+# 中文字型（Windows）
+FONT_PATH = r"C:\Windows\Fonts\msjh.ttc"
+FONT_SIZE = 42
+
+# ───────── 啟動診斷 ─────────
+def _boot_check() -> bool:
+    print(f"[BOOT] Python : {sys.executable}", flush=True)
+    print(f"[BOOT] Script : {__file__}", flush=True)
+    print(f"[BOOT] VIDEO  : {VIDEO}", flush=True)
+    print(f"[BOOT] MODEL  : {MODEL}", flush=True)
+    ok = True
+    if not Path(VIDEO).exists():
+        print("[ERROR] 找不到影片檔，請檢查 VIDEO 路徑。", flush=True)
+        ok = False
+    if not Path(MODEL).exists():
+        print("[ERROR] 找不到模型檔，請檢查 MODEL 路徑。", flush=True)
+        ok = False
+    return ok
 
 # ───────── MediaPipe Pose ─────────
+print("[BOOT] 匯入 mediapipe…", flush=True)
 try:
     import mediapipe as mp
 except Exception:
-    sys.exit("請先安裝 mediapipe： pip install mediapipe==0.10.14")
+    print("[ERROR] 無法匯入 mediapipe。請安裝：pip install mediapipe==0.10.14", flush=True)
+    raise
+print("[OK] mediapipe 匯入完成", flush=True)
 mp_pose = mp.solutions.pose
 
 ANGLE_TRIPLETS: List[Tuple[int,int,int]] = [
-    (11, 13, 15), (12, 14, 16),     # 肘
-    (23, 25, 27), (24, 26, 28),     # 膝
-    (15, 13, 11), (16, 14, 12),     # 腕‑肘‑肩
-    (12, 24, 26), (11, 23, 25)      # 肩‑髖‑膝
+    (11, 13, 15), (12, 14, 16),
+    (23, 25, 27), (24, 26, 28),
+    (15, 13, 11), (16, 14, 12),
+    (12, 24, 26), (11, 23, 25)
 ]
 
 @dataclass
@@ -61,7 +85,6 @@ class FeatConfig:
     use_z: bool = True
     win_size: int = 5
     wrist_idx: int = 16
-
 
 def _angle(kps: List[Dict[str,float]], a: int, b: int, c: int) -> float:
     ax, ay = kps[a]['x'], kps[a]['y']
@@ -71,7 +94,6 @@ def _angle(kps: List[Dict[str,float]], a: int, b: int, c: int) -> float:
     dot  = v1[0]*v2[0] + v1[1]*v2[1]
     norm = (math.hypot(*v1) * math.hypot(*v2)) + 1e-6
     return math.acos(max(-1.0, min(1.0, dot/norm)))
-
 
 def frame_basic_feat(kps: List[Dict[str,float]], cfg: FeatConfig):
     feat: List[float] = []
@@ -88,7 +110,6 @@ def frame_basic_feat(kps: List[Dict[str,float]], cfg: FeatConfig):
     wrist_y = kps[cfg.wrist_idx]['y']
     return feat, hip_y, left_ankle_y, right_ankle_y, wrist_y
 
-
 def landmarks_to_kps(landmarks):
     if landmarks is None:
         return None
@@ -96,7 +117,6 @@ def landmarks_to_kps(landmarks):
     if not lm or len(lm) < 33:
         return None
     return [{'x': float(lm[i].x), 'y': float(lm[i].y), 'z': float(getattr(lm[i],'z',0.0))} for i in range(33)]
-
 
 def run(video_path: Path, model_path: Path):
     payload = joblib.load(model_path)
@@ -120,6 +140,12 @@ def run(video_path: Path, model_path: Path):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(str(VIDEO_OUT), fourcc, fps/max(1,STRIDE), (W, H))
 
+    try:
+        font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+    except Exception as e:
+        print(f"[WARN] 載入字型失敗：{e}，改用預設字型（可能無法顯示中文）", flush=True)
+        font = ImageFont.load_default()
+
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=1,
                         enable_segmentation=False, min_detection_confidence=MIN_DET,
                         min_tracking_confidence=0.5)
@@ -134,6 +160,10 @@ def run(video_path: Path, model_path: Path):
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # 若需要旋轉畫面，可啟用下一行：
+            # frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
             if STRIDE > 1 and (idx % STRIDE != 0):
                 idx += 1
                 if writer is not None:
@@ -171,17 +201,21 @@ def run(video_path: Path, model_path: Path):
 
             preds.append(label); confs.append(conf)
 
-            # simple smoothing (majority of last SMOOTH frames)
+            # 多數決平滑
             if SMOOTH and len(preds) >= SMOOTH:
                 from collections import Counter as C
                 label = C(preds[-SMOOTH:]).most_common(1)[0][0]
 
+            # 疊字影片（Pillow 支援中文）
             if writer is not None:
-                overlay = frame.copy()
+                pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_img, "RGBA")
                 txt = f"{label} ({conf:.2f})"
-                cv2.rectangle(overlay, (10, 10), (340, 80), (0,0,0), -1)
-                cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
-                cv2.putText(frame, txt, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255,255,255), 3, cv2.LINE_AA)
+                text_w = int(draw.textlength(txt, font=font)) + 24
+                text_h = FONT_SIZE + 18
+                draw.rectangle((10, 10, 10 + text_w, 10 + text_h), fill=(0, 0, 0, 160))
+                draw.text((20, 16), txt, font=font, fill=(255, 255, 255, 255))
+                frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
                 writer.write(frame)
 
             idx += 1
@@ -194,23 +228,51 @@ def run(video_path: Path, model_path: Path):
     # final result
     if preds:
         mv = Counter(preds).most_common(1)[0]
-        print(f"片段多數類別: {mv[0]} (count={mv[1]}/{len(preds)})")
+        print(f"片段多數類別: {mv[0]} (count={mv[1]}/{len(preds)})", flush=True)
     else:
-        print("影片內沒有有效的姿態偵測結果。")
+        print("影片內沒有有效的姿態偵測結果。", flush=True)
+
+    # －－－ 輸出區：Excel / CSV －－－
+    # 準備表格資料
+    frame_indices = [i*STRIDE for i in range(len(preds))]
+
+    if SAVE_XLSX:
+        df = pd.DataFrame({
+            "frame_index": frame_indices,
+            "pred": preds,
+            "confidence": confs
+        })
+        df.to_excel(XLSX_PATH, index=False)   # 需要 openpyxl
+        print(f"已輸出 Excel： {XLSX_PATH}", flush=True)
 
     if SAVE_CSV:
         import csv
-        with open(CSV_PATH, 'w', newline='', encoding='utf-8') as f:
+        with open(CSV_PATH, 'w', newline='', encoding='utf-8-sig') as f:
             w = csv.writer(f)
             w.writerow(["frame_index","pred","confidence"])
             for i,(lab,c) in enumerate(zip(preds,confs)):
-                w.writerow([i*STRIDE, lab, c])
-        print(f"已輸出逐影格結果： {CSV_PATH}")
-
+                w.writerow([frame_indices[i], lab, c])
+        print(f"已輸出逐影格結果（CSV）： {CSV_PATH}", flush=True)
 
 if __name__ == '__main__':
-    # Optional positional override: video, model
-    if len(sys.argv) >= 3:
-        VIDEO = Path(sys.argv[1])
-        MODEL = Path(sys.argv[2])
-    run(VIDEO, MODEL)
+    try:
+        if len(sys.argv) >= 3:
+            VIDEO = Path(sys.argv[1])
+            MODEL = Path(sys.argv[2])
+
+        if not _boot_check():
+            sys.exit(1)
+
+        print("[RUN] 開始執行…", flush=True)
+        run(VIDEO, MODEL)
+        print("[DONE] 執行完成", flush=True)
+    except SystemExit as e:
+        print(f"[SystemExit] {e}", flush=True)
+        raise
+    except Exception:
+        print("[EXCEPTION] 發生未預期錯誤：", flush=True)
+        traceback.print_exc()
+        try:
+            input("↑ 上面是錯誤詳情，按 Enter 關閉…")
+        except Exception:
+            pass
