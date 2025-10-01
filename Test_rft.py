@@ -27,17 +27,17 @@ except Exception:
     sys.exit("請先安裝：pip install pandas openpyxl")
 
 # ======= 這兩行請改成你的路徑（若不用位置參數） =======
-VIDEO = Path(r"D:\Special topic data collection(1)\videos\IMG_8196.MOV")
+VIDEO = Path("D:\\Special topic data collection(1)\\videos\\IMG_8195.MOV")
 MODEL = Path("save_all_pose_rft_20250917.pkl")
 # =====================================================
 
 # Quick toggles
 SAVE_CSV    = False                          # ← 預設關閉 CSV
-CSV_PATH    = Path("IMG_8196_demo.csv")
+CSV_PATH    = Path("IMG_8195_demo.csv")
 SAVE_XLSX   = True                           # ← 輸出 Excel
-XLSX_PATH   = Path("IMG_8196_demo.xlsx")
+XLSX_PATH   = Path("IMG_8195_demo.xlsx")
 SAVE_VIDEO  = True
-VIDEO_OUT   = Path("IMG_8196_demo.mp4")
+VIDEO_OUT   = Path("IMG_8195_demo.mp4")
 
 STRIDE     = 2
 SMOOTH     = 5
