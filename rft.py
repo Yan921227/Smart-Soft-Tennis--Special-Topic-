@@ -1,69 +1,89 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Balanced RandomForest — A 方案（強化版）
-- 特徵：
-    * 穩健骨架標準化（肩寬/胯寬/軀幹長 中位數 + 窗口中位數平滑 + 尺度下限）
-    * 33 點的 (x, y, [z]) + 8 個關節角
-    * 離地 proxy：gap_l, gap_r, gap_m（標準化座標）
-    * 時間特徵：hip_v、wrist_v、max_clear(窗口最大正向離地量)、mean_hip、mean_w_v
-- 切分：GroupShuffleSplit（強制測試集涵蓋所有類別，多 seed）
-- CV：StratifiedGroupKFold（如無則退回 GroupKFold）
-- 訓練端：進階類只保留「在空中」幀（top-q by max_clear）
-- 推論端：時間平滑（WIN/HYST） + 嚴格 gating（τ、max_clear 門檻、信心邊際、最短連續幀）
+brf_strong_opt.py — Balanced RandomForest 強化版（優化）
+維持你的方法論：穩健尺度 + in-air 過濾 + group 切分 + 平滑/gating
+但在 IO、數值穩定、速度與維護性上做強化；提供多個開關讓你「快/準」自由切換。
 """
 
-import json, math, sys
+# ====== 0) 依賴自動安裝（含 imbalanced-learn / ujson 可選） ======
+import sys, subprocess
+def _ensure(pkgs):
+    miss = []
+    for p in pkgs:
+        try: __import__(p)
+        except Exception: miss.append(p)
+    if miss:
+        print(f"[INFO] 安裝缺套件：{miss}")
+        code = subprocess.call([sys.executable, "-m", "pip", "install", *miss])
+        if code != 0:
+            print("[ERROR] 自動安裝失敗；請手動安裝：", " ".join(miss)); sys.exit(1)
+
+_ensure(["numpy", "scikit_learn", "joblib", "tqdm", "imbalanced_learn"])
+# ujson 非必要；若無則退回 json
+try:
+    import ujson as jsonlib
+except Exception:
+    import json as jsonlib
+
+# ====== 1) 匯入 ======
 from pathlib import Path
 from collections import Counter, deque, defaultdict
+import time
 import numpy as np
 import joblib
+from tqdm import tqdm
 
 from sklearn.preprocessing  import LabelEncoder
 from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, GroupKFold
 from sklearn.metrics        import classification_report, confusion_matrix
 
-# ---- 可用則採用 StratifiedGroupKFold（sklearn>=1.3）----
 try:
     from sklearn.model_selection import StratifiedGroupKFold
     _HAS_SGK = True
 except Exception:
     _HAS_SGK = False
 
-# ---- imbalanced-learn ----
-try:
-    from imblearn.ensemble import BalancedRandomForestClassifier
-except ModuleNotFoundError:
-    sys.exit("請先安裝：  pip install -U imbalanced-learn")
+from imblearn.ensemble import BalancedRandomForestClassifier
 
-# =============== 全域參數 ===============
-ROOT         = Path("output_json")
-USE_Z        = True
-SKIP_EVERY   = 1
-TEST_RATE    = 0.30
-MAX_RETRY    = 500
-RANDOM_SEED0 = 42
+# ====== 2) 全域設定（你可以只改這區） ======
+ROOT           = Path("output_json")
+USE_Z          = True
+SKIP_EVERY     = 1           # 每隔幀取 1，>1 可加速
+FILE_LIMIT     = None        # 例如 100：每資料夾最多讀 100 個 json（加速用）；None = 全部
+TEST_RATE      = 0.30
+RANDOM_SEED0   = 42
+REQUIRE_ALL_CLASSES = True   # True：測試集必須涵蓋所有類別；False：允許缺
 
-WIN_SIZE     = 5      # 時間窗口（用來算 max_clear 等）
-WRIST_IDX    = 16     # 右手腕(左手持拍可改15)
+# 尺度與時間窗口
+WIN_SIZE     = 5
+WRIST_IDX    = 16
+SCALE_WIN    = 9
+SCALE_FLOOR  = 0.05
 
-# ---- 尺度平滑（關鍵！避免離地特徵爆掉）----
-SCALE_WIN    = 9       # 尺度滑動窗口（幀）— 用中位數平滑
-SCALE_FLOOR  = 0.05    # 尺度下限（避免尺度太小造成放大）
-
-# ---- 時間平滑 & gating（保守）----
+# 時間平滑與 gating（預設只平滑、不 gating；要更保守再打開）
+USE_SMOOTH   = True
 SMOOTH_WIN   = 15
 SMOOTH_HYST  = 9
-GATE_TAU     = 0.90    # 進階機率門檻
-GAP_Q        = 0.97    # 非進階 max_clear 的分位數門檻（0.95~0.98）
-MARGIN_MIN   = 0.12    # 信心邊際（top1 - top2）
-MIN_RUN      = 12      # 進階最短連續幀數
 
-# ---- 訓練端：只保留「進階 in‑air 幀」的比例（Top-q by max_clear）----
+USE_GATING   = False
+GATE_TAU     = 0.90
+GAP_Q        = 0.97
+MARGIN_MIN   = 0.12
+MIN_RUN      = 12
+
+# 訓練端：進階 in-air 篩選
 FILTER_ADV_IN_AIR = True
-ADV_KEEP_TOPQ     = 0.40   # 例如保留最高的 40% 進階幀
+ADV_KEEP_TOPQ     = 0.40
 
-# ---- 資料夾 → 類別 ----
+# 模型與調參
+USE_GRID      = False   # True 會做小格網搜尋；False 直接訓練以提速
+BASE_PARAMS   = dict(n_estimators=400, max_depth=None, min_samples_leaf=2,
+                     max_features="sqrt", sampling_strategy="auto",
+                     replacement=False, n_jobs=-1, random_state=42, oob_score=False)
+GRID_PARAMS   = {"max_depth":[None,16], "min_samples_leaf":[2,4], "max_features":["sqrt","log2"]}
+
+# 你的類別對應
 FOLDER2LABEL = {
     'IMG_1158':'正拍','IMG_1159':'正拍','IMG_1160':'正拍',
     'IMG_1174':'反拍', 'IMG_1217':'反拍',
@@ -75,192 +95,276 @@ FOLDER2LABEL = {
     'IMG_1227':'進階高壓發球','IMG_1228':'進階高壓發球',
 }
 
-# =============== 幾何輔助 ===============
-ANGLE_TRIPLETS = [
-    (11,13,15),(12,14,16),
-    (23,25,27),(24,26,28),
-    (15,13,11),(16,14,12),
-    (12,24,26),(11,23,25)
-]
+# ====== 3) 幾何輔助（向量化角度計算） ======
+ANGLE_TRIPLETS = np.array([
+    [11,13,15],[12,14,16],
+    [23,25,27],[24,26,28],
+    [15,13,11],[16,14,12],
+    [12,24,26],[11,23,25]
+], dtype=int)
 
-def _angle(kps, a,b,c):
-    ax, ay = kps[a]['x'], kps[a]['y']
-    bx, by = kps[b]['x'], kps[b]['y']
-    cx, cy = kps[c]['x'], kps[c]['y']
-    v1 = (ax-bx, ay-by); v2 = (cx-bx, cy-by)
-    dot = v1[0]*v2[0] + v1[1]*v2[1]
-    den = (math.hypot(*v1)*math.hypot(*v2) + 1e-6)
-    return math.acos(max(-1.0, min(1.0, dot/den)))
+def _angles_from_points(P: np.ndarray, triplets: np.ndarray) -> np.ndarray:
+    """
+    P: (33,3) 已正規化
+    triplets: (K,3) 索引
+    回傳 (K,) 角度（弧度）
+    """
+    a = P[triplets[:,0], :2]
+    b = P[triplets[:,1], :2]
+    c = P[triplets[:,2], :2]
+    v1 = a - b
+    v2 = c - b
+    n1 = np.linalg.norm(v1, axis=1) + 1e-6
+    n2 = np.linalg.norm(v2, axis=1) + 1e-6
+    cosang = np.clip((v1*v2).sum(axis=1)/(n1*n2), -1.0, 1.0)
+    return np.arccos(cosang)
 
-# ---- 穩健尺度：肩寬、胯寬、軀幹長 的中位數 ----
-def _robust_scale_now(kps):
-    sh = math.hypot(kps[11]['x'] - kps[12]['x'], kps[11]['y'] - kps[12]['y'])
-    hip= math.hypot(kps[23]['x'] - kps[24]['x'], kps[23]['y'] - kps[24]['y'])
-    cx_sh = (kps[11]['x'] + kps[12]['x'])/2; cy_sh = (kps[11]['y'] + kps[12]['y'])/2
-    cx_hp = (kps[23]['x'] + kps[24]['x'])/2; cy_hp = (kps[23]['y'] + kps[24]['y'])/2
-    torso  = math.hypot(cx_sh - cx_hp, cy_sh - cy_hp)
-    raw = np.median([sh, hip, torso])
-    return max(raw, 1e-6)
+# ====== 4) 解析與正規化 ======
+POSE = {"ls":11,"rs":12,"le":13,"re":14,"lw":15,"rw":16,"lh":23,"rh":24,"lk":25,"rk":26,"la":27,"ra":28,"lfi":31,"rfi":32}
 
-def _normalize_pose_with_scale(kps, scale):
-    hip_cx = (kps[23]['x'] + kps[24]['x'])/2.0
-    hip_cy = (kps[23]['y'] + kps[24]['y'])/2.0
-    nkps = []
-    for p in kps:
-        nx = (p['x'] - hip_cx)/scale
-        ny = (p['y'] - hip_cy)/scale
-        if USE_Z:
-            nkps.append({'x': nx, 'y': ny, 'z': p.get('z',0.0)/scale})
+def _ensure_33(frame) -> np.ndarray:
+    """把 frame 轉為 (33,3)：x,y,z；不足補 nan。支援常見 schema。"""
+    if isinstance(frame, dict):
+        if "pose_landmarks" in frame and "landmark" in frame["pose_landmarks"]:
+            arr = frame["pose_landmarks"]["landmark"]
+        elif "landmarks" in frame:  # 自訂
+            arr = frame["landmarks"]
+        elif "pose" in frame and isinstance(frame["pose"], list):
+            arr = frame["pose"]
         else:
-            nkps.append({'x': nx, 'y': ny})
-    return nkps
+            arr = frame.get("landmark", [])
+    elif isinstance(frame, list):
+        arr = frame
+    else:
+        arr = []
 
-# =============== 單幀特徵（穩健尺度 + 角度 + 離地3） ===============
-def frame_basic_feat(kps, scale_hist):
-    # 1) 更新尺度平滑列
-    scale_hist.append(_robust_scale_now(kps))
+    out = np.full((33,3), np.nan, dtype=np.float32)
+    n = min(33, len(arr))
+    for i in range(n):
+        if isinstance(arr[i], dict):
+            out[i,0] = arr[i].get("x", np.nan)
+            out[i,1] = arr[i].get("y", np.nan)
+            out[i,2] = arr[i].get("z", 0.0)
+        elif isinstance(arr[i], (list, tuple)) and len(arr[i]) >= 2:
+            out[i,0], out[i,1] = arr[i][0], arr[i][1]
+            out[i,2] = arr[i][2] if len(arr[i])>2 else 0.0
+    return out
+
+def _load_frames(path: Path):
+    data = jsonlib.loads(path.read_text(encoding="utf-8"))
+    frames = []
+    if isinstance(data, list):
+        for fr in data: frames.append(_ensure_33(fr))
+    elif isinstance(data, dict) and "frames" in data and isinstance(data["frames"], list):
+        for fr in data["frames"]: frames.append(_ensure_33(fr))
+    else:
+        frames.append(_ensure_33(data))
+    return frames
+
+def _robust_scale_now(P: np.ndarray) -> float:
+    ls, rs, lh, rh = POSE["ls"], POSE["rs"], POSE["lh"], POSE["rh"]
+    sh  = np.linalg.norm(P[ls,:2] - P[rs,:2])
+    hip = np.linalg.norm(P[lh,:2] - P[rh,:2])
+    shc = (P[ls,:2] + P[rs,:2]) / 2
+    hpc = (P[lh,:2] + P[rh,:2]) / 2
+    torso = np.linalg.norm(shc - hpc)
+    raw = np.nanmedian([sh, hip, torso])
+    return float(max(raw, 1e-6))
+
+def _normalize_with_scale(P: np.ndarray, scale: float) -> np.ndarray:
+    lh, rh = POSE["lh"], POSE["rh"]
+    hipc = (P[lh,:2] + P[rh,:2]) / 2
+    Q = P.copy()
+    Q[:,:2] -= hipc
+    Q[:,:] /= max(scale, SCALE_FLOOR)
+    return Q
+
+def _frame_basic_feat(P: np.ndarray, scale_hist: deque):
+    """回傳: feature(list), hip_y, la_y, ra_y, wrist_y, gap_m"""
+    scale_hist.append(_robust_scale_now(P))
     scale = max(np.median(scale_hist), SCALE_FLOOR)
+    Q = _normalize_with_scale(P, scale)
 
-    # 2) 以平滑尺度做標準化
-    nkps = _normalize_pose_with_scale(kps, scale)
+    # 展開座標
+    if USE_Z:
+        flat = Q.reshape(-1)
+    else:
+        flat = Q[:,:2].reshape(-1)
 
-    # 3) 展開座標
-    feat = []
-    for p in nkps:
-        feat.extend([p['x'], p['y']])
-        if USE_Z: feat.append(p['z'])
+    # 8 角（弧度）
+    ang = _angles_from_points(Q, ANGLE_TRIPLETS)
 
-    # 4) 8 角
-    feat.extend([_angle(nkps,*tri) for tri in ANGLE_TRIPLETS])
+    # 離地 proxy
+    lh, rh, la, ra, rw = POSE["lh"], POSE["rh"], POSE["la"], POSE["ra"], WRIST_IDX
+    hip_y = (Q[lh,1] + Q[rh,1]) / 2.0
+    la_y, ra_y = Q[la,1], Q[ra,1]
+    gap_l, gap_r = hip_y - la_y, hip_y - ra_y
+    gap_m = (gap_l + gap_r) / 2.0
+    wrist_y = Q[rw,1]
 
-    # 5) 離地 proxy
-    hip_y = (nkps[23]['y'] + nkps[24]['y'])/2.0
-    la_y  = nkps[31]['y']; ra_y = nkps[32]['y']
-    gap_l = hip_y - la_y; gap_r = hip_y - ra_y
-    gap_m = (gap_l + gap_r)/2.0
-    feat.extend([gap_l, gap_r, gap_m])
+    feat = np.concatenate([flat, ang, np.array([gap_l, gap_r, gap_m], dtype=np.float32)], axis=0)
+    return feat.astype(np.float32), float(hip_y), float(la_y), float(ra_y), float(wrist_y), float(gap_m)
 
-    wrist_y = nkps[WRIST_IDX]['y']
-    return feat, hip_y, la_y, ra_y, wrist_y, gap_m
+# ====== 5) 資料讀取（非遞迴 + 可抽樣） ======
+def iter_files_non_recursive():
+    for folder in sorted(ROOT.iterdir()):
+        if not folder.is_dir(): continue
+        lab = FOLDER2LABEL.get(folder.name)
+        if lab is None: continue
+        files = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower()==".json"])
+        if FILE_LIMIT: files = files[:FILE_LIMIT]
+        yield folder.name, lab, files
 
-# =============== 讀資料 + 時間特徵 ===============
-rows, labels, groups = [], [], []
-for folder in sorted(ROOT.iterdir()):
-    if not folder.is_dir(): continue
-    lab = FOLDER2LABEL.get(folder.name)
-    if lab is None: continue
+def build_dataset():
+    rows, labels, groups = [], [], []
+    per_class = defaultdict(int)
 
-    # 尺度與時間緩衝列
-    scale_hist = deque(maxlen=SCALE_WIN)
-    hip_hist   = deque(maxlen=WIN_SIZE)
-    wrist_hist = deque(maxlen=WIN_SIZE)
-    clr_hist   = deque(maxlen=WIN_SIZE)  # 正向離地量（clearance = -gap_m）
+    t0 = time.time()
+    for group, lab, files in iter_files_non_recursive():
+        scale_hist = deque(maxlen=SCALE_WIN)
+        hip_hist   = deque(maxlen=WIN_SIZE)
+        wrist_hist = deque(maxlen=WIN_SIZE)
+        clr_hist   = deque(maxlen=WIN_SIZE)
 
-    for i, jf in enumerate(sorted(folder.glob("*.json"))):
-        if i % SKIP_EVERY: continue
-        with open(jf,'r',encoding='utf-8') as f:
-            data = json.load(f)
-        kps = (data.get('pose') or
-               (data.get('results',[{}])[0]).get('pose_landmarks') or
-               (data[0].get('keypoints') if isinstance(data,list) else None))
-        if kps is None: continue
+        for i, jf in enumerate(files):
+            if i % SKIP_EVERY: continue
+            try:
+                frames = _load_frames(jf)
+            except Exception:
+                continue
+            # 逐幀生成（這邊假設每個 json 代表單幀；若多幀也能處理）
+            for P in frames:
+                feat, hip_y, la_y, ra_y, wrist_y, gap_m = _frame_basic_feat(P, scale_hist)
+                hip_v   = hip_y   - (hip_hist[-1]   if hip_hist   else hip_y)
+                wrist_v = wrist_y - (wrist_hist[-1] if wrist_hist else wrist_y)
 
-        basic, hip_y, la_y, ra_y, wrist_y, gap_m = frame_basic_feat(kps, scale_hist)
+                hip_hist.append(hip_y); wrist_hist.append(wrist_y)
+                clearance = -gap_m; clr_hist.append(clearance)
 
-        # 一階速度
-        hip_v   = hip_y - (hip_hist[-1] if hip_hist else hip_y)
-        wrist_v = wrist_y - (wrist_hist[-1] if wrist_hist else wrist_y)
+                # 窗口統計
+                max_clear = max(clr_hist)
+                mean_hip  = float(np.mean(hip_hist))
+                if len(wrist_hist) > 1:
+                    diffs = np.diff(np.array(wrist_hist, dtype=np.float32))
+                    mean_w_v = float(np.mean(diffs))
+                else:
+                    mean_w_v = 0.0
 
-        # 更新窗口
-        hip_hist.append(hip_y)
-        wrist_hist.append(wrist_y)
-        clearance = -gap_m  # 正向離地量
-        clr_hist.append(clearance)
+                rows.append(np.concatenate([feat, np.array([hip_v, wrist_v, max_clear, mean_hip, mean_w_v], dtype=np.float32)]))
+                labels.append(lab)
+                groups.append(group)
+                per_class[lab] += 1
 
-        # 窗口統計
-        max_clear  = max(clr_hist)
-        mean_hip   = sum(hip_hist)/len(hip_hist)
-        mean_w_v   = (sum(wrist_hist[i]-wrist_hist[i-1]
-                      for i in range(1,len(wrist_hist))) / max(1, len(wrist_hist)-1))
+    if not rows:
+        raise RuntimeError("未讀到任何樣本，請確認資料夾與 JSON 格式。")
 
-        rows.append(basic + [hip_v, wrist_v, max_clear, mean_hip, mean_w_v])
-        labels.append(lab)
-        groups.append(folder.name)
+    print("\n=== 各類別樣本數 ===")
+    total = 0
+    for name in sorted(per_class.keys()):
+        print(f"  {name}: {per_class[name]}")
+        total += per_class[name]
+    print(f"  總計: {total} | 讀取時間: {time.time()-t0:.1f}s")
 
-X = np.asarray(rows, dtype='float32')
-groups = np.asarray(groups)
-le = LabelEncoder(); y = le.fit_transform(labels)
+    X = np.asarray(rows, dtype=np.float32)
+    le = LabelEncoder(); y = le.fit_transform(labels)
+    groups = np.asarray(groups)
+    return X, y, groups, le
 
-print("樣本總數:", len(rows), Counter(labels))
+# ====== 6) 切分（Group-aware，多 seed） ======
+def group_split_cover_all(X, y, groups, require_all=True, test_rate=0.3, max_retry=300, seed0=42):
+    ALL = set(np.unique(y))
+    for s in range(seed0, seed0+max_retry):
+        gss = GroupShuffleSplit(test_size=test_rate, n_splits=1, random_state=s)
+        tr, te = next(gss.split(X, y, groups))
+        if (not require_all) or (set(y[te]) == ALL):
+            return tr, te, s
+    # 退讓：回傳最後一次切分
+    tr, te = next(GroupShuffleSplit(test_size=test_rate, n_splits=1, random_state=seed0).split(X, y, groups))
+    print("[WARN] 無法覆蓋所有類別，已回退到最後一次切分；建議增加各類別的影片數。")
+    return tr, te, seed0
 
-# === 基本特徵長度（用來抓 gap_m 位置、但 gating 我們用 max_clear）===
-D_BASIC = 33*(2 + (1 if USE_Z else 0)) + len(ANGLE_TRIPLETS) + 3
-# 附加時間特徵附加次序：[hip_v, wrist_v, max_clear, mean_hip, mean_w_v]
-CLEAR_IDX = -3  # max_clear 在整體向量中的索引
+# ====== 7) 主流程 ======
+def main():
+    X, y, groups, le = build_dataset()
+    tr_idx, te_idx, seed = group_split_cover_all(
+        X, y, groups, require_all=REQUIRE_ALL_CLASSES, test_rate=TEST_RATE, seed0=RANDOM_SEED0
+    )
+    X_tr, X_te = X[tr_idx], X[te_idx]
+    y_tr, y_te = y[tr_idx], y[te_idx]
+    groups_tr  = groups[tr_idx]
+    print(f"\n切分成功（seed={seed}）：train={len(tr_idx)}  test={len(te_idx)}")
 
-# =============== Group 切分（測試含全類別，多 seed） ===============
-ALL = set(range(len(le.classes_)))
-found=False
-for seed in range(RANDOM_SEED0, RANDOM_SEED0+MAX_RETRY):
-    gss = GroupShuffleSplit(test_size=TEST_RATE, n_splits=1, random_state=seed)
-    tr_idx, te_idx = next(gss.split(X, y, groups))
-    if set(y[te_idx]) == ALL:
-        found=True; break
-if not found:
-    sys.exit("測試集仍缺類別，請增加每類別的影片資料夾數或提高 MAX_RETRY。")
+    # --- in-air 過濾（只對進階類） ---
+    CLEAR_IDX = -3  # [hip_v, wrist_v, max_clear, mean_hip, mean_w_v] → max_clear 在倒數第3
+    lbl_to_idx = {n:i for i,n in enumerate(le.classes_)}
+    ADV = lbl_to_idx.get("進階高壓發球", None)
+    if FILTER_ADV_IN_AIR and ADV is not None:
+        adv_mask = (y_tr == ADV)
+        if np.sum(adv_mask) > 12:
+            thr = float(np.quantile(X_tr[adv_mask, CLEAR_IDX], 1-ADV_KEEP_TOPQ))
+            keep = (~adv_mask) | (X_tr[:, CLEAR_IDX] >= thr)
+            print(f"(info) in-air 門檻 = {thr:.3f}，進階幀: {np.sum(adv_mask)} → {np.sum(adv_mask & (X_tr[:, CLEAR_IDX] >= thr))}")
+            X_tr, y_tr, groups_tr = X_tr[keep], y_tr[keep], groups_tr[keep]
 
-X_tr, X_te = X[tr_idx], X[te_idx]
-y_tr, y_te = y[tr_idx], y[te_idx]
-groups_tr  = groups[tr_idx]
-print(f"切分成功（seed={seed}）：train={len(tr_idx)}  test={len(te_idx)}")
+    # --- 訓練 ---
+    base = BalancedRandomForestClassifier(**BASE_PARAMS)
+    if not USE_GRID:
+        clf = base.fit(X_tr, y_tr)
+        best_params = BASE_PARAMS
+        print("(info) 使用基底參數訓練（不做 GridSearch）")
+    else:
+        cv = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42) if _HAS_SGK else GroupKFold(n_splits=3)
+        grid = GridSearchCV(base, GRID_PARAMS, scoring="f1_macro", n_jobs=-1, cv=cv, verbose=1, error_score=np.nan)
+        grid.fit(X_tr, y_tr, groups=groups_tr)
+        clf = grid.best_estimator_
+        best_params = grid.best_params_
+        print("Best params:", best_params)
 
-# =============== 進階 in-air 訓練過濾（可關） ===============
-ADV = {n:i for i,n in enumerate(le.classes_)}.get('進階高壓發球', None)
+    # --- 評估（逐幀） ---
+    proba = clf.predict_proba(X_te)
+    y_pred = np.argmax(proba, axis=1)
 
-if FILTER_ADV_IN_AIR and ADV is not None:
-    adv_mask = (y_tr == ADV)
-    if np.sum(adv_mask) > 12:  # 足夠幀數才過濾
-        thr_in_air = np.quantile(X_tr[adv_mask, CLEAR_IDX], 1-ADV_KEEP_TOPQ)
-        keep_mask = (~adv_mask) | (X_tr[:, CLEAR_IDX] >= thr_in_air)
-        print(f"(info) 訓練集進階 in-air 門檻 = {thr_in_air:.3f}，進階幀由 {np.sum(adv_mask)} → {np.sum(adv_mask & (X_tr[:, CLEAR_IDX] >= thr_in_air))}")
-        X_tr, y_tr, groups_tr = X_tr[keep_mask], y_tr[keep_mask], groups_tr[keep_mask]
+    print("\n=== 原始逐幀 ===")
+    print(classification_report(y_te, y_pred, target_names=le.classes_))
+    print("混淆矩陣:\n", confusion_matrix(y_te, y_pred))
 
-# =============== BRF（A 方案）：只用 auto 取樣 ===============
-brf = BalancedRandomForestClassifier(
-    n_estimators=400,
-    max_depth=None,
-    min_samples_leaf=2,
-    max_features="sqrt",
-    sampling_strategy="auto",   # 每折自動 under-sampling
-    replacement=False,
-    n_jobs=-1, random_state=42, oob_score=False
-)
+    # --- 時間平滑 ---
+    if USE_SMOOTH:
+        y_pred = _smooth_by_group(proba, groups[te_idx], te_idx, win=SMOOTH_WIN, hyst=SMOOTH_HYST)
+        print("\n=== 時間平滑後 ===")
+        print(classification_report(y_te, y_pred, target_names=le.classes_))
+        print("混淆矩陣:\n", confusion_matrix(y_te, y_pred))
 
-# CV：優先使用 StratifiedGroupKFold
-cv = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42) if _HAS_SGK else GroupKFold(n_splits=3)
+    # --- 嚴格 gating（可選） ---
+    gap_thr = 0.0
+    if USE_GATING:
+        nonadv = X_tr[:, CLEAR_IDX] if ADV is None else X_tr[y_tr != ADV, CLEAR_IDX]
+        gap_thr = float(np.quantile(nonadv, GAP_Q)) if len(nonadv) else 0.0
+        y_pred = _gate_adv_strict(proba, X_te, y_pred, ADV, tau=GATE_TAU, gap_thr=gap_thr, margin=MARGIN_MIN, min_run=MIN_RUN)
+        print("\n=== 平滑 + 嚴格 gating 後 ===")
+        print(f"(info) τ={GATE_TAU}, GAP_THR={gap_thr:.4f}, margin={MARGIN_MIN}, min_run={MIN_RUN}")
+        print(classification_report(y_te, y_pred, target_names=le.classes_))
+        print("混淆矩陣:\n", confusion_matrix(y_te, y_pred))
 
-grid = GridSearchCV(
-    brf,
-    {"max_depth":[None,16],
-     "min_samples_leaf":[2,4],
-     "max_features":["sqrt","log2"]},
-    scoring="f1_macro",
-    n_jobs=-1, cv=cv, verbose=1,
-    error_score=np.nan
-)
-grid.fit(X_tr, y_tr, groups=groups_tr)
-clf = grid.best_estimator_
-print("Best params:", grid.best_params_)
+    # --- 儲存 ---
+    out_path = "20251008softtennis_pose_brf_auto_strong_opt.pkl"
+    joblib.dump({"model": clf, "label_encoder": le}, out_path, compress=3)
+    meta = {
+        "best_params": best_params,
+        "use_grid": USE_GRID,
+        "use_smooth": USE_SMOOTH,
+        "use_gating": USE_GATING,
+        "gap_thr": gap_thr,
+        "classes": list(le.classes_),
+        "feature_dim": int(X.shape[1]),
+        "test_rate": TEST_RATE,
+        "seed": seed
+    }
+    Path("meta.json").write_text(jsonlib.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n✅ 已存模型：{out_path}\n✅ meta：meta.json")
 
-# =============== 評估（逐幀） ===============
-proba_te   = clf.predict_proba(X_te)
-y_pred_raw = np.argmax(proba_te, axis=1)
-print("\n=== BRF（auto）原始逐幀 ===")
-print(classification_report(y_te, y_pred_raw, target_names=le.classes_))
-print("混淆矩陣:\n", confusion_matrix(y_te, y_pred_raw))
-
-# =============== 時間平滑 ===============
-def smooth_by_folder(proba, folders, te_indices, win=15, hyst=5):
+# ====== 8) 平滑 / gating 函式 ======
+def _smooth_by_group(proba, folders, te_indices, win=15, hyst=5):
     y_pred = np.argmax(proba, axis=1).copy()
     if win<=1 and hyst<=1: return y_pred
     out = y_pred.copy()
@@ -269,10 +373,9 @@ def smooth_by_folder(proba, folders, te_indices, win=15, hyst=5):
         order = idx[np.argsort(te_indices[idx])]
         P = proba[order]
         T,C = P.shape
-        ker = np.ones(win)/win if win>1 else np.array([1.0])
+        ker = np.ones(win, dtype=np.float32)/win if win>1 else np.array([1.0], dtype=np.float32)
         P_s = np.zeros_like(P)
-        for c in range(C):
-            P_s[:,c] = np.convolve(P[:,c], ker, mode='same')
+        for c in range(C): P_s[:,c] = np.convolve(P[:,c], ker, mode='same')
         y_hat = np.argmax(P_s, axis=1)
         if hyst>1 and T>0:
             cur=y_hat[0]; run=0
@@ -285,37 +388,19 @@ def smooth_by_folder(proba, folders, te_indices, win=15, hyst=5):
         out[order]=y_hat
     return out
 
-folders_te   = groups[te_idx]
-y_pred_smooth= smooth_by_folder(proba_te, folders_te, te_idx, win=SMOOTH_WIN, hyst=SMOOTH_HYST)
-print("\n=== 使用時間平滑後 ===")
-print(classification_report(y_te, y_pred_smooth, target_names=le.classes_))
-print("混淆矩陣:\n", confusion_matrix(y_te, y_pred_smooth))
-
-# =============== 嚴格 gating（進階）— 用 max_clear 門檻 ===============
-# 用訓練集「非進階」幀的 max_clear（更穩）估門檻
-if ADV is not None:
-    maxclr_nonadv_tr = X_tr[y_tr != ADV, CLEAR_IDX]
-else:
-    maxclr_nonadv_tr = X_tr[:, CLEAR_IDX]
-GAP_THR = float(np.quantile(maxclr_nonadv_tr, GAP_Q)) if len(maxclr_nonadv_tr) else 0.0
-
-def gate_adv_strict(proba, X_te, pred_in, adv_idx, tau=0.90, gap_thr=0.0, margin=0.12, min_run=12):
+def _gate_adv_strict(proba, X_te, pred_in, adv_idx, tau=0.90, gap_thr=0.0, margin=0.12, min_run=12):
     out = pred_in.copy()
     if adv_idx is None or np.sum(out==adv_idx)==0: return out
     p_adv = proba[np.arange(len(out)), adv_idx]
-    # 次高機率
     p2    = np.partition(proba, -2, axis=1)[:, -2]
     margin_ok = (p_adv - p2) >= margin
-    # 用窗口最大正向離地量判定是否真的有跳
+    CLEAR_IDX = -3
     clearance = X_te[:, CLEAR_IDX]
     keep = (p_adv>=tau) & (clearance>=gap_thr) & margin_ok
-
     to_demote = (out==adv_idx) & (~keep)
     if np.any(to_demote):
         sec = np.argsort(proba[to_demote], axis=1)[:, -2]
         out[to_demote] = sec
-
-    # 最短連續幀限制
     if min_run>1:
         i=0; N=len(out)
         while i<N:
@@ -328,28 +413,5 @@ def gate_adv_strict(proba, X_te, pred_in, adv_idx, tau=0.90, gap_thr=0.0, margin
             i=j
     return out
 
-y_pred_final = gate_adv_strict(
-    proba_te, X_te, y_pred_smooth, ADV,
-    tau=GATE_TAU, gap_thr=GAP_THR, margin=MARGIN_MIN, min_run=MIN_RUN
-)
-print("\n=== 時間平滑 + 嚴格 gating 後 ===")
-print(f"(info) τ={GATE_TAU}, GAP_THR={GAP_THR:.4f}, margin={MARGIN_MIN}, min_run={MIN_RUN}")
-print(classification_report(y_te, y_pred_final, target_names=le.classes_))
-print("混淆矩陣:\n", confusion_matrix(y_te, y_pred_final))
-
-# =============== 方便檢查：max_clear 分佈（可觀察門檻是否合理） ===============
-def debug_clearance_stats(X, y, le, idx=CLEAR_IDX, title="max_clear 分佈"):
-    print(f"\n=== {title} ===")
-    for ci, name in enumerate(le.classes_):
-        vals = X[y==ci, idx]
-        if len(vals)==0: continue
-        q = np.percentile(vals, [50, 90, 95, 99])
-        print(f"{name:>10s}: n={len(vals):5d} | p50={q[0]:.3f} p90={q[1]:.3f} p95={q[2]:.3f} p99={q[3]:.3f}")
-
-debug_clearance_stats(X_tr, y_tr, le, idx=CLEAR_IDX, title="(train) max_clear")
-debug_clearance_stats(X_te, y_te, le, idx=CLEAR_IDX, title="(test)  max_clear")
-
-# =============== 儲存（模型+標籤器） ===============
-out_path = "20251006softtennis_pose_brf_auto_strong.pkl"
-joblib.dump({"model": clf, "label_encoder": le}, out_path, compress=3)
-print(f"\n✅ 已存 {out_path}")
+if __name__ == "__main__":
+    main()
