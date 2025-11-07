@@ -3,13 +3,19 @@ import json, math
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+import csv
 from pathlib import Path
 
 # ================================
-# 1) 檔案路徑
+# 1) 檔案路徑設定
 # ================================
-data_path  = Path("D:\\Special topic data collection(1)\\Mediapipe Json\\IMG_8192\\frame_00485.json")
-image_path = Path("D:\\Special topic data collection(1)\\picture\\IMG_8192\\frame_00485.jpg")
+# 輸入路徑
+data_path  = Path("output_json\\IMG_1163\\frame_02293.json")
+image_path = Path("D:\\Special topic data collection(3)\\frames\\IMG_1163\\frame_02293.jpg")
+
+# 輸出路徑
+output_image_path = "IMG_1163_frame_02293_angle_letters.jpg"
+output_csv_path = "IMG_1163_frame_02293_angle_letters.csv"
 
 # ================================
 # 2) 讀圖片
@@ -160,11 +166,11 @@ for joint_name, (pA, pB, pC) in joints.items():
     else:
         angles_out.append(f"{labels_for_joint.get(joint_name,'?')} ({joint_name}): 缺少關節點 {pA},{pB},{pC}")
 
-print("各角度：")
+print("各角度:")
 for line in angles_out:
     print("  " + line)
 
-# 畫點與「字母」標記（不畫數字角度）
+# 畫點與「字母」標記(不畫數字角度)
 r = 8
 for joint_name, (pA, pB, pC) in joints.items():
     if pA in landmarks and pB in landmarks and pC in landmarks:
@@ -179,6 +185,24 @@ for joint_name, (pA, pB, pC) in joints.items():
 
 # 存檔
 annotated = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-out_path = "frame_00485_angle_letters.jpg"
-cv2.imwrite(out_path, annotated)
-print(f"已輸出：{out_path}")
+cv2.imwrite(output_image_path, annotated)
+print(f"已輸出圖片：{output_image_path}")
+
+# 輸出角度到 CSV
+with open(output_csv_path, "w", newline="", encoding="utf-8-sig") as csvfile:
+    writer = csv.writer(csvfile)
+    # 寫入標題
+    writer.writerow(["Joint", "Label", "Angle (degrees)"])
+    # 寫入每個角度資料
+    for joint_name, (pA, pB, pC) in joints.items():
+        label = labels_for_joint.get(joint_name, "?")
+        if pA in landmarks and pB in landmarks and pC in landmarks:
+            A, B, C = landmarks[pA], landmarks[pB], landmarks[pC]
+            ang = calculate_angle(A, B, C)
+            if ang is None:
+                writer.writerow([joint_name, label, "N/A"])
+            else:
+                writer.writerow([joint_name, label, f"{ang:.1f}"])
+        else:
+            writer.writerow([joint_name, label, "Missing Points"])
+print(f"已輸出 CSV：{output_csv_path}")

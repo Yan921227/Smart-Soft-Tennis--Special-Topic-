@@ -9,7 +9,11 @@ csv_output_overlay/
 csv_output/
 runs/
 YOLO_txt_output_overlay/
-
+frames_CapCut/
+output_json_CapCut/
+data/
+output_classified_images/
+output_frames_forehand/
 # 忽略常見圖片格式
 *.png
 *.jpg
@@ -23,3 +27,5 @@ YOLO_txt_output_overlay/
 *.csv
 *.mp4
 *.xlsx
+*.7z
+*.zip

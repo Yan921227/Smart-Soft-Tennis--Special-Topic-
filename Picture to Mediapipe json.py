@@ -105,7 +105,7 @@ def process_folder_separate(input_folder, output_folder):
 
 if __name__ == '__main__':
     # 請將 input_folder 改成你的圖片資料夾路徑
-    input_folder = "D:\\Special topic data collection(3)\\frames\\IMG_1228"
+    input_folder = "frames_CapCut\\IMG_8195"
     # 請將 output_folder 改成你想儲存結果的資料夾路徑（這裡改為 py 檔案所在目錄中的子資料夾）
-    output_folder = os.path.join(os.getcwd(), "output_json", "IMG_1228")
+    output_folder = os.path.join(os.getcwd(), "output_json_CapCut", "IMG_8195")
     process_folder_separate(input_folder, output_folder)

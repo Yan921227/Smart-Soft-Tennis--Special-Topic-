@@ -2,31 +2,34 @@
 # -*- coding: utf-8 -*-
 """
 brf_strong_opt.py — Balanced RandomForest 強化版（優化）
-維持你的方法論：穩健尺度 + in-air 過濾 + group 切分 + 平滑/gating
-但在 IO、數值穩定、速度與維護性上做強化；提供多個開關讓你「快/準」自由切換。
+- 已強化跳躍特徵 (加速度、相對高度)
+- **已啟用 GATING：透過 GATE_TAU, GAP_Q, MIN_RUN 進行嚴格時序後處理**
 """
 
 # ====== 0) 依賴自動安裝（含 imbalanced-learn / ujson 可選） ======
 import sys, subprocess
 def _ensure(pkgs):
+    # 使用 import 名稱做檢查，安裝時使用 pip 名稱
+    install_pkgs = {"sklearn": "scikit-learn", "numpy": "numpy", 
+                    "joblib": "joblib", "tqdm": "tqdm", "imbalanced_learn": "imbalanced-learn"}
+    
     miss = []
     for p in pkgs:
         try: __import__(p)
-        except Exception: miss.append(p)
+        except Exception: miss.append(install_pkgs.get(p, p))
     if miss:
         print(f"[INFO] 安裝缺套件：{miss}")
-        code = subprocess.call([sys.executable, "-m", "pip", "install", *miss])
+        # 確保安裝時使用正確的 pip 名稱
+        pip_pkgs = [install_pkgs.get(p, p) for p in miss]
+        code = subprocess.call([sys.executable, "-m", "pip", "install", *pip_pkgs])
         if code != 0:
-            print("[ERROR] 自動安裝失敗；請手動安裝：", " ".join(miss)); sys.exit(1)
+            print("[ERROR] 自動安裝失敗；請手動安裝：", " ".join(pip_pkgs)); sys.exit(1)
 
-_ensure(["numpy", "scikit_learn", "joblib", "tqdm", "imbalanced_learn"])
-# ujson 非必要；若無則退回 json
-try:
-    import ujson as jsonlib
-except Exception:
-    import json as jsonlib
+# 注意: scikit_learn 的 import 名稱是 sklearn
+_ensure(["numpy", "sklearn", "joblib", "tqdm", "imbalanced_learn"])
 
 # ====== 1) 匯入 ======
+import json
 from pathlib import Path
 from collections import Counter, deque, defaultdict
 import time
@@ -47,41 +50,42 @@ except Exception:
 from imblearn.ensemble import BalancedRandomForestClassifier
 
 # ====== 2) 全域設定（你可以只改這區） ======
-ROOT           = Path("output_json")
-USE_Z          = True
-SKIP_EVERY     = 1           # 每隔幀取 1，>1 可加速
-FILE_LIMIT     = None        # 例如 100：每資料夾最多讀 100 個 json（加速用）；None = 全部
-TEST_RATE      = 0.30
-RANDOM_SEED0   = 42
-REQUIRE_ALL_CLASSES = True   # True：測試集必須涵蓋所有類別；False：允許缺
+ROOT            = Path("output_json")
+USE_Z           = True
+SKIP_EVERY      = 1             
+FILE_LIMIT      = None          
+TEST_RATE       = 0.30
+RANDOM_SEED0    = 42
+REQUIRE_ALL_CLASSES = True      
 
 # 尺度與時間窗口
-WIN_SIZE     = 5
-WRIST_IDX    = 16
-SCALE_WIN    = 9
-SCALE_FLOOR  = 0.05
+WIN_SIZE        = 5
+WRIST_IDX       = 16
+SCALE_WIN       = 9
+SCALE_FLOOR     = 0.05
+REL_HEIGHT_WIN  = 30            
 
-# 時間平滑與 gating（預設只平滑、不 gating；要更保守再打開）
-USE_SMOOTH   = True
-SMOOTH_WIN   = 15
-SMOOTH_HYST  = 9
+# 時間平滑與 gating（啟用 GATING）
+USE_SMOOTH      = True
+SMOOTH_WIN      = 15    
+SMOOTH_HYST     = 9     
 
-USE_GATING   = False
-GATE_TAU     = 0.90
-GAP_Q        = 0.97
-MARGIN_MIN   = 0.12
-MIN_RUN      = 12
+USE_GATING      = True    # <--- 啟用 GATING
+GATE_TAU        = 0.65    # 進階發球機率門檻 (大幅降低到0.65)
+GAP_Q           = 0.75    # <--- 非進階動作的 Clearance 分位數 (大幅降低到0.75)
+MARGIN_MIN      = 0.08    # <--- 進階機率與次高機率的最小差距 (降低到0.08)
+MIN_RUN         = 8       # <--- 最小連續幀數要求 (大幅降低到8)
 
 # 訓練端：進階 in-air 篩選
 FILTER_ADV_IN_AIR = True
-ADV_KEEP_TOPQ     = 0.40
+ADV_KEEP_TOPQ     = 0.25        # 回調至 0.25，確保足夠數據量
 
-# 模型與調參
-USE_GRID      = False   # True 會做小格網搜尋；False 直接訓練以提速
-BASE_PARAMS   = dict(n_estimators=400, max_depth=None, min_samples_leaf=2,
-                     max_features="sqrt", sampling_strategy="auto",
-                     replacement=False, n_jobs=-1, random_state=42, oob_score=False)
-GRID_PARAMS   = {"max_depth":[None,16], "min_samples_leaf":[2,4], "max_features":["sqrt","log2"]}
+# 模型與調參 
+USE_GRID        = False         
+BASE_PARAMS     = dict(n_estimators=400, max_depth=None, min_samples_leaf=2,
+                       max_features="sqrt", sampling_strategy="auto", # <--- 使用 "auto"
+                       replacement=False, n_jobs=-1, random_state=42, oob_score=False)
+GRID_PARAMS     = {"max_depth":[None,16], "min_samples_leaf":[2,4], "max_features":["sqrt","log2"]}
 
 # 你的類別對應
 FOLDER2LABEL = {
@@ -89,7 +93,6 @@ FOLDER2LABEL = {
     'IMG_1174':'反拍', 'IMG_1217':'反拍',
     'IMG_1219':'切球', 'IMG_1220':'切球',
     'IMG_1163':'基礎高壓發球','IMG_1164':'基礎高壓發球',
-    # 'IMG_1165':'基礎高壓發球','IMG_1166':'基礎高壓發球',
     'IMG_1179':'進階高壓發球','IMG_1221':'進階高壓發球',
     'IMG_1224':'進階高壓發球','IMG_1225':'進階高壓發球',
     'IMG_1227':'進階高壓發球','IMG_1228':'進階高壓發球',
@@ -151,7 +154,7 @@ def _ensure_33(frame) -> np.ndarray:
     return out
 
 def _load_frames(path: Path):
-    data = jsonlib.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
     frames = []
     if isinstance(data, list):
         for fr in data: frames.append(_ensure_33(fr))
@@ -195,7 +198,7 @@ def _frame_basic_feat(P: np.ndarray, scale_hist: deque):
     ang = _angles_from_points(Q, ANGLE_TRIPLETS)
 
     # 離地 proxy
-    lh, rh, la, ra, rw = POSE["lh"], POSE["rh"], POSE["la"], POSE["ra"], WRIST_IDX
+    lh, rh, la, ra, rw = POSE["lh"], POSE["rs"], POSE["la"], POSE["ra"], WRIST_IDX
     hip_y = (Q[lh,1] + Q[rh,1]) / 2.0
     la_y, ra_y = Q[la,1], Q[ra,1]
     gap_l, gap_r = hip_y - la_y, hip_y - ra_y
@@ -225,6 +228,10 @@ def build_dataset():
         hip_hist   = deque(maxlen=WIN_SIZE)
         wrist_hist = deque(maxlen=WIN_SIZE)
         clr_hist   = deque(maxlen=WIN_SIZE)
+        
+        # 強化跳躍特徵所需
+        sequence_clr_min = deque(maxlen=REL_HEIGHT_WIN) # 紀錄最近 N 幀的最低 clearance
+        wrist_v_hist = deque(maxlen=3) # 用於加速度
 
         for i, jf in enumerate(files):
             if i % SKIP_EVERY: continue
@@ -232,14 +239,21 @@ def build_dataset():
                 frames = _load_frames(jf)
             except Exception:
                 continue
-            # 逐幀生成（這邊假設每個 json 代表單幀；若多幀也能處理）
+            
             for P in frames:
                 feat, hip_y, la_y, ra_y, wrist_y, gap_m = _frame_basic_feat(P, scale_hist)
+                
+                # 速度計算
                 hip_v   = hip_y   - (hip_hist[-1]   if hip_hist   else hip_y)
                 wrist_v = wrist_y - (wrist_hist[-1] if wrist_hist else wrist_y)
 
+                # **新增: 手腕加速度**
+                wrist_v_hist.append(wrist_v)
+                wrist_acc = wrist_v - (wrist_v_hist[-2] if len(wrist_v_hist) >= 2 else 0.0)
+
                 hip_hist.append(hip_y); wrist_hist.append(wrist_y)
                 clearance = -gap_m; clr_hist.append(clearance)
+                sequence_clr_min.append(clearance) 
 
                 # 窗口統計
                 max_clear = max(clr_hist)
@@ -250,7 +264,15 @@ def build_dataset():
                 else:
                     mean_w_v = 0.0
 
-                rows.append(np.concatenate([feat, np.array([hip_v, wrist_v, max_clear, mean_hip, mean_w_v], dtype=np.float32)]))
+                # **新增: 相對高度特徵**
+                min_clr_in_seq = min(sequence_clr_min) if sequence_clr_min else clearance
+                rel_clearance = clearance - min_clr_in_seq 
+
+                # 合併特徵 (總共 7 個動態特徵)
+                # [hip_v, wrist_v, max_clear, mean_hip, mean_w_v, wrist_acc, rel_clearance]
+                new_feats = np.array([hip_v, wrist_v, max_clear, mean_hip, mean_w_v, wrist_acc, rel_clearance], dtype=np.float32)
+                
+                rows.append(np.concatenate([feat, new_feats]))
                 labels.append(lab)
                 groups.append(group)
                 per_class[lab] += 1
@@ -295,12 +317,15 @@ def main():
     print(f"\n切分成功（seed={seed}）：train={len(tr_idx)}  test={len(te_idx)}")
 
     # --- in-air 過濾（只對進階類） ---
-    CLEAR_IDX = -3  # [hip_v, wrist_v, max_clear, mean_hip, mean_w_v] → max_clear 在倒數第3
+    # 動態特徵組為 7 個， max_clear 是倒數第 5 個
+    # [hip_v, wrist_v, max_clear, mean_hip, mean_w_v, wrist_acc, rel_clearance]
+    CLEAR_IDX = -5  
     lbl_to_idx = {n:i for i,n in enumerate(le.classes_)}
     ADV = lbl_to_idx.get("進階高壓發球", None)
     if FILTER_ADV_IN_AIR and ADV is not None:
         adv_mask = (y_tr == ADV)
         if np.sum(adv_mask) > 12:
+            # ADV_KEEP_TOPQ 回調至 0.25
             thr = float(np.quantile(X_tr[adv_mask, CLEAR_IDX], 1-ADV_KEEP_TOPQ))
             keep = (~adv_mask) | (X_tr[:, CLEAR_IDX] >= thr)
             print(f"(info) in-air 門檻 = {thr:.3f}，進階幀: {np.sum(adv_mask)} → {np.sum(adv_mask & (X_tr[:, CLEAR_IDX] >= thr))}")
@@ -335,19 +360,23 @@ def main():
         print(classification_report(y_te, y_pred, target_names=le.classes_))
         print("混淆矩陣:\n", confusion_matrix(y_te, y_pred))
 
-    # --- 嚴格 gating（可選） ---
+    # --- 嚴格 gating（啟用 GATING） ---
     gap_thr = 0.0
     if USE_GATING:
+        # 根據訓練集中非進階動作的 99% 分位數設定高度門檻
         nonadv = X_tr[:, CLEAR_IDX] if ADV is None else X_tr[y_tr != ADV, CLEAR_IDX]
         gap_thr = float(np.quantile(nonadv, GAP_Q)) if len(nonadv) else 0.0
-        y_pred = _gate_adv_strict(proba, X_te, y_pred, ADV, tau=GATE_TAU, gap_thr=gap_thr, margin=MARGIN_MIN, min_run=MIN_RUN)
+        
+        y_pred = _gate_adv_strict(proba, X_te, y_pred, ADV, tau=GATE_TAU, 
+                                  gap_thr=gap_thr, margin=MARGIN_MIN, min_run=MIN_RUN, 
+                                  clear_idx=CLEAR_IDX) 
         print("\n=== 平滑 + 嚴格 gating 後 ===")
         print(f"(info) τ={GATE_TAU}, GAP_THR={gap_thr:.4f}, margin={MARGIN_MIN}, min_run={MIN_RUN}")
         print(classification_report(y_te, y_pred, target_names=le.classes_))
         print("混淆矩陣:\n", confusion_matrix(y_te, y_pred))
 
     # --- 儲存 ---
-    out_path = "20251008softtennis_pose_brf_auto_strong_opt.pkl"
+    out_path = "20251009softtennis_pose_brf_auto_strong_opt.pkl"
     joblib.dump({"model": clf, "label_encoder": le}, out_path, compress=3)
     meta = {
         "best_params": best_params,
@@ -360,7 +389,7 @@ def main():
         "test_rate": TEST_RATE,
         "seed": seed
     }
-    Path("meta.json").write_text(jsonlib.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    Path("meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n✅ 已存模型：{out_path}\n✅ meta：meta.json")
 
 # ====== 8) 平滑 / gating 函式 ======
@@ -388,19 +417,31 @@ def _smooth_by_group(proba, folders, te_indices, win=15, hyst=5):
         out[order]=y_hat
     return out
 
-def _gate_adv_strict(proba, X_te, pred_in, adv_idx, tau=0.90, gap_thr=0.0, margin=0.12, min_run=12):
+def _gate_adv_strict(proba, X_te, pred_in, adv_idx, tau=0.90, gap_thr=0.0, margin=0.12, min_run=12, clear_idx=-5):
+    """
+    對進階高壓發球進行嚴格過濾。
+    注意: 使用 clear_idx 參數來適應特徵維度變化。
+    """
     out = pred_in.copy()
     if adv_idx is None or np.sum(out==adv_idx)==0: return out
+    
     p_adv = proba[np.arange(len(out)), adv_idx]
-    p2    = np.partition(proba, -2, axis=1)[:, -2]
+    p2      = np.partition(proba, -2, axis=1)[:, -2]
     margin_ok = (p_adv - p2) >= margin
-    CLEAR_IDX = -3
-    clearance = X_te[:, CLEAR_IDX]
+    
+    # 使用 CLEAR_IDX 判斷跳躍高度
+    clearance = X_te[:, clear_idx]
+    
+    # 必須同時滿足 高機率、高跳躍、高優勢
     keep = (p_adv>=tau) & (clearance>=gap_thr) & margin_ok
     to_demote = (out==adv_idx) & (~keep)
+    
     if np.any(to_demote):
+        # 降級：改成機率第二高的類別
         sec = np.argsort(proba[to_demote], axis=1)[:, -2]
         out[to_demote] = sec
+        
+    # 執行最小運行長度檢查
     if min_run>1:
         i=0; N=len(out)
         while i<N:
@@ -408,6 +449,7 @@ def _gate_adv_strict(proba, X_te, pred_in, adv_idx, tau=0.90, gap_thr=0.0, margi
             j=i
             while j<N and out[j]==adv_idx: j+=1
             if (j-i)<min_run:
+                # 降級短區段：改成機率第二高的類別
                 sec_seg = np.argsort(proba[i:j], axis=1)[:, -2]
                 out[i:j] = sec_seg
             i=j
